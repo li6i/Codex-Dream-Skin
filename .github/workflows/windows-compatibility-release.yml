@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - windows-v1.5.22-codex.1
+      - windows-v1.5.22-codex.2
 
 permissions:
   contents: read
@@ -14,11 +14,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: windows-v1.5.22-codex.1
+  RELEASE_TAG: windows-v1.5.22-codex.2
 
 jobs:
   portable:
-    if: github.event.repository.fork && github.ref == 'refs/tags/windows-v1.5.22-codex.1'
+    if: github.event.repository.fork && github.ref == 'refs/tags/windows-v1.5.22-codex.2'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
