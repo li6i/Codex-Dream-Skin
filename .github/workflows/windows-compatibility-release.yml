@@ -1,0 +1,183 @@
+name: Windows compatibility prerelease
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - windows-v1.5.22-codex.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-compatibility-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: windows-v1.5.22-codex.1
+
+jobs:
+  portable:
+    if: github.event.repository.fork && github.ref == 'refs/tags/windows-v1.5.22-codex.1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Test shared payloads
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < windows/VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(tr -d '[:space:]' < macos/VERSION)" = "$version"
+          test "$(node -p 'require("./macos/package.json").version')" = "$version"
+          grep -Fx "SKIN_VERSION=\"$version\"" macos/scripts/common-macos.sh
+          grep -Fx "const SKIN_VERSION = \"$version\";" macos/scripts/injector.mjs
+          grep -Fx "const SKIN_VERSION = \"$version\";" windows/scripts/injector.mjs
+          node tools/sync-runtime-assets.mjs --check
+          node tools/check-selector-provenance.mjs
+          node --test macos/tests/*.test.mjs windows/tests/*.test.mjs tools/*.test.mjs
+          node macos/scripts/injector.mjs --check-payload
+          node windows/scripts/injector.mjs --check-payload
+
+  build:
+    needs: portable
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Test and build the native theme manager
+        shell: cmd
+        run: |
+          dotnet run --configuration Release --project windows/theme-manager/Tests/DreamSkin.ThemeManager.Tests.csproj || exit /b 1
+          dotnet run --configuration Release --project windows/theme-manager/NativeTests/DreamSkin.ThemeManager.NativeTests.csproj || exit /b 1
+          node tools/build-theme-manager.mjs
+
+      - name: Install pinned Inno Setup
+        shell: pwsh
+        run: |
+          choco upgrade innosetup --version=6.7.1 --allow-downgrade --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install Inno Setup 6.7.1.' }
+          $iscc = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe is missing.' }
+          "ISCC_PATH=$iscc" >> $env:GITHUB_ENV
+
+      - name: Run Windows regressions
+        shell: pwsh
+        run: |
+          foreach ($powershell in @('powershell.exe', 'pwsh.exe')) {
+            foreach ($suite in @('run-tests.ps1', 'installer-static.tests.ps1')) {
+              & $powershell -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File "./windows/tests/$suite"
+              if ($LASTEXITCODE -ne 0) { throw "$powershell failed $suite with exit code $LASTEXITCODE." }
+            }
+          }
+
+      - name: Build Windows installer and SHA-256 file
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw windows/VERSION).Trim()
+          if ($env:RELEASE_TAG -notmatch ('^windows-v' + [regex]::Escape($version) + '-codex\.[1-9][0-9]*$')) {
+            throw 'The Windows version does not match the prerelease tag.'
+          }
+          $output = Join-Path $env:RUNNER_TEMP 'windows-installer'
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned `
+            -File ./windows/installer/build-release.ps1 -OutputDirectory $output -IsccPath $env:ISCC_PATH
+          if ($LASTEXITCODE -ne 0) { throw "Installer build failed with exit code $LASTEXITCODE." }
+          $artifact = Get-Item -LiteralPath (Join-Path $output "CodexDreamSkin-Setup-v$version.exe")
+          if ($artifact.Length -le 0) { throw 'Windows installer is empty.' }
+          $name = "CodexDreamSkin-Setup-$env:RELEASE_TAG.exe"
+          Rename-Item -LiteralPath $artifact.FullName -NewName $name
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $output $name)).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$hash  $name`n")
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-compatibility-installer
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/windows-installer/CodexDreamSkin-Setup-${{ env.RELEASE_TAG }}.exe
+            ${{ runner.temp }}/windows-installer/SHA256SUMS.txt
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-compatibility-installer
+
+      - name: Publish verified fork prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="CodexDreamSkin-Setup-${RELEASE_TAG}.exe"
+          test -s "$installer"
+          sha256sum --check SHA256SUMS.txt
+
+          tag_path="repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
+          tag_sha="$(gh api "$tag_path" --jq '.object.sha')"
+          if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "The tag already points to $tag_sha instead of $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          verify_assets() {
+            local expected_draft="$1"
+            local installer_digest="sha256:$(sha256sum "$installer" | cut -d' ' -f1)"
+            local checksum_digest="sha256:$(sha256sum SHA256SUMS.txt | cut -d' ' -f1)"
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets |
+              jq -e --argjson draft "$expected_draft" --arg name "$installer" \
+                --arg binary "$installer_digest" --arg checksum "$checksum_digest" '
+                  .isDraft == $draft and .isPrerelease and (.assets | length == 2) and
+                  any(.assets[]; .name == $name and .digest == $binary and .size > 0 and .state == "uploaded") and
+                  any(.assets[]; .name == "SHA256SUMS.txt" and .digest == $checksum and .size > 0 and .state == "uploaded")
+                ' >/dev/null
+          }
+
+          if release="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)"; then
+            jq -e '.isPrerelease' <<< "$release" >/dev/null
+            if ! jq -e '.isDraft' <<< "$release" >/dev/null; then
+              # Rebuilt PE files can contain timestamps. Verify the published
+              # files against their own checksum and GitHub's recorded digests.
+              cd "$(mktemp -d)"
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$installer" --pattern SHA256SUMS.txt
+              sha256sum --check SHA256SUMS.txt
+              verify_assets false
+              echo "$RELEASE_TAG is already published and verified."
+              exit 0
+            fi
+            gh release upload "$RELEASE_TAG" "$installer" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$installer" SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+              --title 'DreamSkin Windows compatibility preview' --notes-file - <<'NOTES'
+          Windows x64 预发布版，针对 ChatGPT / Codex 26.1117.3838.0 的标题栏选择器。安装包未签名。
+
+          Windows x64 preview for the title-bar selector in ChatGPT / Codex 26.1117.3838.0. The installer is unsigned.
+          NOTES
+          fi
+          verify_assets true
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          verify_assets false
